@@ -34,7 +34,7 @@ spec:
           name: mysql-conf
       containers:
       - name: redis
-        image: 100.64.10.37/devops/mysql:5.7
+        image: mysql:8.0.29-debian
         volumeMounts:
         - name: mysql-config
           mountPath: /etc/mysql/conf.d/mysql.conf
