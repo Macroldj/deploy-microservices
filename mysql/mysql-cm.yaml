@@ -1,0 +1,28 @@
+# https://kubernetes.io/docs/concepts/configuration/configmap/
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: mysql-conf
+  namespace: castle
+data:
+  mysql.conf: |
+    [mysql]
+    default-character-set=utf8
+    socket=/var/lib/mysql/mysql.sock
+    
+    [mysqld]
+    skip-name-resolve
+    port=3306
+    datadir=/var/lib/mysql
+    socket=/var/lib/mysql/mysql.sock
+    symbolic-links=0
+    sql_mode=NO_ENGINE_SUBSTITUTION,STRICT_TRANS_TABLES
+    character-set-server=utf8
+    default-storage-engine=INNODB
+    lower_case_table_names=1
+    max_allowed_packet=512M
+    
+    [mysqld_safe]
+    log-error=/var/log/mysqld.log
+    pid-file=/var/run/mysqld/mysqld.pid
+---

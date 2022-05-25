@@ -1,0 +1,307 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+spec:
+  selector:
+    app: elasticsearch
+  ports:
+    - protocol: TCP
+      port: 9200
+      targetPort: 9200
+
+---
+apiVersion: v1
+data:
+  metadata-service-mapping.yaml: |
+    serviceName: agentless::${LABELS."service.istio.io/canonical-name",LABELS."app.kubernetes.io/name",LABELS.app}
+    serviceInstanceName: ${NAME,NAME} # Just to skip the "envsubst" replacement
+  alarm-settings.yml: |
+    rules:
+      service_resp_time_rule:
+        metrics-name: service_resp_time
+        threshold: 20 # 20ms is just for demo
+        op: ">"
+        period: 5
+        count: 1
+kind: ConfigMap
+metadata:
+  name: oap-static-config
+
+---
+apiVersion: v1
+data:
+  core.default.log4j-xml: |-
+    <Configuration status="WARN">
+       <Appenders>
+         <Console name="Console" target="SYSTEM_OUT">
+           <PatternLayout charset="UTF-8" pattern="%d - %c - %L [%t] %-5p %x - %m%n"/>
+         </Console>
+       </Appenders>
+       <Loggers>
+         <logger name="io.grpc.netty" level="INFO"/>
+         <logger name="org.apache.skywalking.oap.server.configuration.api" level="TRACE"/>
+         <logger name="org.apache.skywalking.oap.server.configuration.configmap" level="DEBUG"/>
+         <Root level="WARN">
+           <AppenderRef ref="Console"/>
+         </Root>
+        </Loggers>
+    </Configuration>
+kind: ConfigMap
+metadata:
+  labels:
+    app: oap
+  name: oap-dynamic-config
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: es-deployment
+  labels:
+    app: elasticsearch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      containers:
+        - name: elasticsearch
+          image: 100.64.10.37/dev/elasticsearch-oss:7.10.0
+          imagePullPolicy: Always
+          resources:
+            limits:
+              cpu: 4000m
+              memory: "4096Mi"
+            requests:
+              cpu: 2000m
+              memory: "2048Mi"
+          ports:
+            - containerPort: 9200
+          env:
+            - name: 'discovery.type'
+              value: 'single-node'
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oap
+spec:
+  selector:
+    app: oap
+  ports:
+    - name: metrics
+      port: 1234
+    - name: grpc
+      port: 11800
+    - name: http
+      port: 12800
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oap-init-job # @feature: cluster; set up an init job to initialize ES templates and indices
+spec:
+  template:
+    metadata:
+      name: oap-init-job
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: skywalking-sa-cluster
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-es
+          image: 100.64.10.37/dev/busybox:1.30
+          command:
+            - 'sh'
+            - '-c'
+            - 'for i in $(seq 1 60); do nc -z -w3 elasticsearch 9200 && exit 0 || sleep 5; done; exit 1'
+      containers:
+        - name: oap-init
+          image: 100.64.10.37/dev/oap:d3ea14d960ee52f66cc634307999feadea1b91e5
+          imagePullPolicy: Always
+          env: # @feature: cluster; make sure all env vars are the same with the cluster nodes as this will affect templates / indices
+            - name: JAVA_OPTS
+              value: "-Dmode=init" # @feature: cluster; set the OAP mode to "init" so the job can complete
+            - name: SW_OTEL_RECEIVER
+              value: default
+            - name: SW_OTEL_RECEIVER_ENABLED_OC_RULES
+              value: vm,oap
+            - name: SW_STORAGE
+              value: elasticsearch
+            - name: SW_STORAGE_ES_CLUSTER_NODES
+              value: elasticsearch:9200
+            - name: SW_STORAGE_ES_INDEX_REPLICAS_NUMBER
+              value: "0"
+            - name: SW_TELEMETRY
+              value: prometheus
+          volumeMounts:
+            - name: config-volume
+              mountPath: /skywalking/ext-config
+      volumes:
+        - name: config-volume
+          configMap:
+            name: oap-static-config
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oap-deployment
+  labels:
+    app: oap
+spec:
+  replicas: 2 # @feature: cluster; set OAP replicas to >1
+  selector:
+    matchLabels:
+      app: oap
+  template:
+    metadata:
+      labels:
+        app: oap
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: skywalking-sa-cluster # @feature: cluster; set a service account with Pod "read" permission
+      initContainers:
+        - name: wait-for-oap-init
+          image: 100.64.10.37/dev/kubectl:1.20.12
+          command:
+            - 'kubectl'
+            - 'wait'
+            - '--for=condition=complete'
+            - 'job/oap-init-job'
+      containers:
+        - name: oap
+          image: 100.64.10.37/dev/oap:d3ea14d960ee52f66cc634307999feadea1b91e5
+          imagePullPolicy: Always
+          resources:
+            limits:
+              cpu: 4000m
+              memory: "4096Mi"
+            requests:
+              cpu: 2000m
+              memory: "2048Mi"
+          ports:
+            - name: metrics # @feature: so11y; set a name for the metrics port that can be referenced in otel config
+              containerPort: 1234
+            - name: grpc
+              containerPort: 11800
+            - name: http
+              containerPort: 12800
+          env:
+            - name: JAVA_OPTS
+              value: "-Dmode=no-init"
+            - name: SW_CLUSTER
+              value: kubernetes # @feature: cluster; set cluster coordinator to kubernetes
+            - name: SW_CLUSTER_K8S_NAMESPACE
+              value: castle
+            - name: SW_CLUSTER_K8S_LABEL
+              value: app=oap # @feature: cluster; set label selectors to select OAP Pods as a cluster
+            - name: SW_HEALTH_CHECKER
+              value: default
+            - name: SW_OTEL_RECEIVER
+              value: default # @feature: so11y;vm;kubernetes-monitor enable OpenTelemetry receiver to receive OpenTelemetry metrics
+            - name: SW_OTEL_RECEIVER_ENABLED_OC_RULES
+              # @feature: vm; enable vm rules to analyze VM metrics
+              # @feature: so11y; enable oap rules to analyze OAP metrics
+              # @feature: kubernetes-monitor; enable rules to analyze Kubernetes Cluster/Node/Service metrics
+              # @feature: istiod-monitor; enable rules to analyze Istio control plane metrics
+              value: vm,oap,k8s-cluster,k8s-node,k8s-service,istio-controlplane
+            - name: SW_STORAGE
+              value: elasticsearch
+            - name: SW_STORAGE_ES_CLUSTER_NODES
+              value: elasticsearch:9200
+            - name: SW_TELEMETRY
+              value: prometheus # @feature: so11y; expose the metrics of self o11y through prometheus
+            - name: SW_ENVOY_METRIC_ALS_HTTP_ANALYSIS
+              value: "k8s-mesh,persistence" # @feature: als; enable mesh analyzer (k8s-mesh) to analyze ALS logs
+            - name: K8S_SERVICE_NAME_RULE
+              value: "agentless::${service.metadata.name}"
+            - name: SW_CONFIGURATION
+              value: k8s-configmap
+          volumeMounts:
+            - name: config-volume
+              mountPath: /skywalking/ext-config
+      volumes:
+        - name: config-volume
+          configMap:
+            name: oap-static-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rocket-bot
+spec:
+  selector:
+    app: rocket-bot
+  type: NodePort
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rocket-bot-deployment
+  labels:
+    app: rocket-bot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rocket-bot
+  template:
+    metadata:
+      labels:
+        app: rocket-bot
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: skywalking-sa-cluster
+      containers:
+        - name: rocket-bot
+          image: 100.64.10.37/dev/ui:d3ea14d960ee52f66cc634307999feadea1b91e5
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 2000Mi
+            limits:
+              cpu: 2000m
+              memory: 2000Mi
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SW_OAP_ADDRESS
+              value: http://oap:12800

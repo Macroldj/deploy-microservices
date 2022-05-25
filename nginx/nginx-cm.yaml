@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-conf
+  namespace: castle
+data:
+  nginx.conf: |
+    worker_processes  1;
+    events {
+      worker_connections  60000;
+    }
+    env NACOS_SERVER_ADDR;
+    http {
+      include       mime.types;
+      default_type  application/octet-stream;
+      client_max_body_size 200m;
+      client_body_temp_path /var/run/openresty/nginx-client-body;
+      proxy_temp_path       /var/run/openresty/nginx-proxy;
+      fastcgi_temp_path     /var/run/openresty/nginx-fastcgi;
+      uwsgi_temp_path       /var/run/openresty/nginx-uwsgi;
+      scgi_temp_path        /var/run/openresty/nginx-scgi;
+      access_log  logs/access.log;
+      sendfile        on;
+      keepalive_timeout  65;
+      lua_socket_log_errors on;
+      lua_shared_dict dict 10m;
+      lua_package_path 'castle-gateway/?.lua;;';
+      init_worker_by_lua_file castle-gateway/RefreshServerInfo.lua;
+      include http/admin.nginx;
+      include http/gateService.nginx;
+      include http/httpService.nginx;
+      include /etc/nginx/conf.d/*.conf;
+    }
+    stream {
+      init_worker_by_lua_file castle-gateway/RefreshGameServer.lua;
+      upstream game_base {
+        balancer_by_lua_file conf/tcp/GameServerForward.lua;
+        server 0.0.0.0:8888;
+      }
+    server {
+        listen 18181-18281;
+        proxy_pass game_base;
+      }
+    }
